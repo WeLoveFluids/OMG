@@ -1,0 +1,1127 @@
+# =============================================================================
+# ===== CIVL4145 Course Project (2024)
+# ===== MODFLOW 6
+# ===== Base case model (version 000)
+# ===== Preliminary model set-up for leak site
+# ===== 
+# =============================================================================
+
+# =============================================================================
+# ===== 0.0 PYTHON ENVIRONMENT SET-UP =========================================
+# =============================================================================
+import matplotlib.pyplot as plt
+import flopy
+import numpy as np
+import pandas as pd
+import seaborn as sns
+
+# Specifying executable location, working folder and simulation name
+mf6exe = 'C:/CIVL4145/MODFLOW6/mf6.5.0_win64/mf6.5.0_win64/bin/mf6.exe'
+ws = './Run000'
+sim_name = "Base"
+
+# =============================================================================
+# ===== 1.0 DEFINING BASIC FloPy MODEL PROPERTIES =============================
+# =============================================================================
+# Load the monitoring data from CSV files
+installation_data = pd.read_csv('Data-InstallationDay-20240904.csv')
+water_level_data = pd.read_csv('Data-WeeklyWaterLevelMonitoring-20241030.csv')
+nitrate_data = pd.read_csv('Data-WeeklyNitrateMonitoring-20241030.csv')
+
+# ===== 1.1 Setting length and time units
+length_units = "meters"
+time_units = "days"
+# Setting three stress periods (1000 days, 11 years, 50 years)
+stressperiod2=11*52
+stressperiod3=50*52
+
+perlen = [1000, 4*365, 6*365]  # Simulation time [days]
+nper = len(perlen)
+nstp = [10, 4*365, 6*365]
+tsmult = [1.0, 1.0, 1.0]
+
+# ===== 1.2 Setting model geometry
+Lx = 3000    # Length of domain in x-direction
+Ly = 2000    # Length of domain in y-direction
+delr = 100.0  # Row width (height) [m] (i.e., dy)
+delc = 100.0  # Column width [m] (i.e., dx)
+# Add extra 2 columns for north & south boundary cells (affects y plot locations)
+nrow = int(np.round(Ly/delr)) # Number of rows
+ncol = int(np.round(Lx/delc)) # Number of columns
+
+nlay = 3  # Number of layers
+delz = [2.0, 1.0, 1.0]  # Layer thickness [m] (starting at top layer)
+top = 4.0  # Elevation of top of the model [m]
+basez = 0.0  # Elevation of base of the model [m]
+# Settng elevation of bottom of each layer
+botz = []
+botz.append(top-delz[0])
+for k in range(1,nlay):
+    botz.append(botz[k-1]-delz[k])
+botm = np.zeros((nlay, nrow, ncol), dtype=float)
+for k in np.arange(nlay):
+    botm[k,:,:] = botz[k]
+
+# ===== 1.3 Setting hydraulic and solute transport properties
+# Porosity [-]
+ngravel = 0.28  # Porosity of gravel
+prsity = np.ones((nlay, nrow, ncol), dtype=float) # Establish variable
+prsity[0,:,:]=ngravel   # Set layer 0 porosity to ngravel
+prsity[1,:,:]=ngravel # Set layer 1 porosity to ngravel
+prsity[2,:,:]=ngravel   # Set layer 2 porosity to ngravel
+
+# Hydraulic conductivity [m/d]
+kgravel = 150.0 # Horizontal hydraulic conductivity of gravel [m/d]
+k11 = np.ones((nlay, nrow, ncol), dtype=float) # Establish variable
+k11[0,:,:] = kgravel
+k11[1,:,:] = kgravel
+k11[2,:,:] = kgravel
+k33 = k11.copy()  # Vertical hydraulic conductivity [m/d]
+
+# Dispersivity (nitrate)
+al = 10.0              # Longitudinal dispersivity [m]
+trpt = 0.5             # Ratio of transverse to longitudinal dispersitivity
+trpv = 0.05            # Ratio of vertical to longitudinal dispersitivity
+ath1 = al * trpt       # Transverse dispersivity [m]
+ath2 = al * trpv       # Vertical dispersivity [m]
+sconc = 0.0            # Starting soute concentration (C(t=0))
+dmcoef = 1.468e-4     # Molecular diffusion coefficient [m**2/d]
+
+# Recharge
+rech = 0.0 # Recharge rate [m/d]
+
+# Specify saturated thickness method
+# (0=constant (confined?), >0=varies with head in cell (unconfined), <0=variable)
+icelltype = 1
+
+# Advection solution options
+mixelm = -1
+# mixelem = 0, the standard finite-difference method with upstream
+#              or central-in-space weighting, depending on the value of NADVFD;
+# mixelem = 1, the forward-tracking method of characteristics (MOC);
+# mixelem = 2, the backward-tracking modified method of characteristics (MMOC);
+# mixelem = 3, the hybrid method of characteristics (HMOC) with MOC or MMOC
+#              automatically and dynamically selected;
+# mixelem = -1, the third-order TVD scheme (ULTIMATE).
+
+# ===== 1.4 Set initial conditions
+h1 = 3.2 # Hydraulic head on northern boundary
+h2 = 2.7 # Hydraulic head on southern boundary
+havg = (h1+h2)/2 # Average hydraulic head to use as initial cond
+strt = np.ones((nlay, nrow, ncol), dtype=float)*havg
+#    l, r, c 
+strt[:, 0, :] = h1   # Specify heads on western boundary
+strt[:, -1,:] = h2  # Specify heads on eastern boundary (Note not fully pen)
+
+# Exlude cells from calculation using idomain flag
+# idomain = 0 --> cells does not exist in simulation, but values are written to it
+# idomain = 1 --> cell exists in simulation
+# idomain = -1 --> cell does not exist in simulation, but flow passes through it
+idomain = np.ones((nlay, nrow, ncol), dtype=int) 
+
+# ===== 1.4 Define well information
+# Define function to get row and column locations from x-y coordinates
+def find_rowcol(x,y,Lx,Ly,delc,delr):
+    # Inputs are
+    # x = real world x coordinate
+    # y = real world y coordinate
+    # Lx = length of domain in x-direction
+    # Ly = length of domain in y-direction
+    # delc = column width (i.e., dx) 
+    # delr = row width (i.e., dy)
+    # Finding nearest cell
+    ycb = np.linspace(0,Ly,num = int(Ly/delr)+1)
+    irowy = np.where((Ly-y) <= ycb)[0][0]
+    xcb = np.linspace(0,Lx,num = int(Lx/delc)+1)
+    jcolx = np.where(x <= xcb)[0][0]
+    # Note adding +1 to column add to account for east boundary cell
+    return jcolx, irowy
+
+# Define pumping rates
+qwell_leak = 64.0   # Volumetric injection rate of leak [m^3/d]
+cwell_leak = 100.0  # Concentration of leak [kg/m^3]
+qwell_ex1 = -150.0  # Well 1 volumetric extraction rate [m^3/d]
+qwell_ex2 = -175.0  # Well 2 volumetric extraction rate [m^3/d]
+qwell_ex3 = -140.0  # Well 3 volumetric extraction rate [m^3/d]
+qwell_ex4 = -155.0  # Well 4 volumetric extraction rate [m^3/d]
+
+cwell_ex = 0.0      # Concentration of extracted
+
+# Well locations (Note: real-world coordinates, not adjusted for bc cells)
+
+# Extraction well 1
+x_ex1 = 1064
+y_ex1 = 1720
+jcolx_ex1, irowy_ex1 = find_rowcol(x_ex1, y_ex1, Lx, Ly, delc, delr)
+
+# Extraction well 2
+x_ex2 = 1988
+y_ex2 = 1720
+jcolx_ex2, irowy_ex2 = find_rowcol(x_ex2, y_ex2, Lx, Ly, delc, delr)
+
+# Extraction well 3
+x_ex3 = 1295
+y_ex3 = 280
+jcolx_ex3, irowy_ex3 = find_rowcol(x_ex3, y_ex3, Lx, Ly, delc, delr)
+
+# Extraction well 4
+x_ex4 = 1701
+y_ex4 = 280
+jcolx_ex4, irowy_ex4 = find_rowcol(x_ex4, y_ex4, Lx, Ly, delc, delr)
+
+# Pipeline leak
+x_leak = 1500
+y_leak = 1000
+jcolx_leak, irowy_leak = find_rowcol(x_leak, y_leak, Lx, Ly, delc, delr)
+
+# MB-01
+x_ex5 = 1500
+y_ex5 = 1750
+jcolx_ex5, irowy_ex5 = find_rowcol(x_ex5, y_ex5, Lx, Ly, delc, delr)
+
+# MB-02
+x_ex6 = 1500
+y_ex6 = 1250
+jcolx_ex6, irowy_ex6 = find_rowcol(x_ex6, y_ex6, Lx, Ly, delc, delr)
+
+# MB-03
+x_ex7 = 1250
+y_ex7 = 900
+jcolx_ex7, irowy_ex7 = find_rowcol(x_ex7, y_ex7, Lx, Ly, delc, delr)
+
+# MB-04
+x_ex8 = 1750
+y_ex8 = 900
+jcolx_ex8, irowy_ex8 = find_rowcol(x_ex8, y_ex8, Lx, Ly, delc, delr)
+
+# MB-05
+x_ex9 = 1000
+y_ex9 = 600
+jcolx_ex9, irowy_ex9 = find_rowcol(x_ex9, y_ex9, Lx, Ly, delc, delr)
+
+# MB-06
+x_ex10 = 2000
+y_ex10 = 600
+jcolx_ex10, irowy_ex10 = find_rowcol(x_ex10, y_ex10, Lx, Ly, delc, delr)
+
+# MB-07
+x_ex11 = 750
+y_ex11 = 300
+jcolx_ex11, irowy_ex11 = find_rowcol(x_ex11, y_ex11, Lx, Ly, delc, delr)
+
+# MB-08
+x_ex12 = 2250
+y_ex12 = 300
+jcolx_ex12, irowy_ex12 = find_rowcol(x_ex12, y_ex12, Lx, Ly, delc, delr)
+
+# MB-09
+x_ex13 = 600
+y_ex13 = 100
+jcolx_ex13, irowy_ex13 = find_rowcol(x_ex13, y_ex13, Lx, Ly, delc, delr)
+
+# MB-10
+x_ex14 = 2400
+y_ex14 = 100
+jcolx_ex14, irowy_ex14 = find_rowcol(x_ex14, y_ex14, Lx, Ly, delc, delr)
+
+
+# Actual head values for the MB wells
+head_values_mb = {
+    'MB-01': 3.320,  # Head value for MB-01
+    'MB-02': 3.484,  # Head value for MB-02
+    'MB-03': 3.477,  # Head value for MB-03
+    'MB-04': 3.435,  # Head value for MB-04
+    'MB-05': 3.298,  # Head value for MB-05
+    'MB-06': 3.275,  # Head value for MB-06
+    'MB-07': 3.062,  # Head value for MB-07
+    'MB-08': 3.067,  # Head value for MB-08
+    'MB-09': 2.826,  # Head value for MB-09
+    'MB-10': 2.826   # Head value for MB-10
+}
+
+
+# Specifying well details
+#          sp  [(l,          r,          c), flow,  conc]
+spd_mf6 = {0: [[(2, irowy_ex1, jcolx_ex1), qwell_ex1, cwell_ex],
+               [(2, irowy_ex2, jcolx_ex2), qwell_ex2, cwell_ex],
+               [(2, irowy_ex3, jcolx_ex3), qwell_ex3, cwell_ex],
+               [(2, irowy_ex4, jcolx_ex4), qwell_ex4, cwell_ex],
+               [(0, irowy_leak,jcolx_leak), 0,0]],
+           1: [[(2, irowy_ex1, jcolx_ex1), qwell_ex1, cwell_ex],
+               [(2, irowy_ex2, jcolx_ex2), qwell_ex2, cwell_ex],
+               [(2, irowy_ex3, jcolx_ex3), qwell_ex3, cwell_ex],
+               [(2, irowy_ex4, jcolx_ex4), qwell_ex4, cwell_ex],
+               [(0, irowy_leak,jcolx_leak),qwell_leak,cwell_leak]],
+           2: [[(2, irowy_ex1, jcolx_ex1), qwell_ex1, cwell_ex],
+               [(2, irowy_ex2, jcolx_ex2), qwell_ex2, cwell_ex],
+               [(2, irowy_ex3, jcolx_ex3), qwell_ex3, cwell_ex],
+               [(2, irowy_ex4, jcolx_ex4), qwell_ex4, cwell_ex],
+               [(0, irowy_leak,jcolx_leak),0,0]],}
+
+# ===== 1.5 Define recharge information
+# Recharge stress perdiod data needed if recharge method 1 (general recharge
+# package is used).
+rchspd = []
+for i in range(nrow):
+    for j in range(ncol):
+        #             [(lay, row, col), recharge, conc]
+        rchspd.append([(  0,   i,   j),     rech,  0.0])
+rchspd = {0: rchspd, 1: rchspd, 2: rchspd}
+
+# ===== 1.6 Define constant head boundaries
+chdspd = []
+# Loop through the left & right sides.
+for k in np.arange(nlay):
+    for j in np.arange(ncol):
+        #              (l, r, c),          head, conc
+        chdspd.append([(k, 0, j), strt[k, 0, j], 0.0])
+        # chdspd.append([(k, i, ncol - 1), strt[k, i, ncol - 1], 0.0])
+        chdspd.append([(k, nrow-1, j), strt[k, nrow-1, j], 0.0])
+
+chdspd = {0: chdspd, 1: chdspd, 2: chdspd}
+
+# ===== 1.7 Define solver settings
+nouter, ninner = 100, 300
+hclose, rclose, relax = 1e-6, 1e-6, 1.0
+percel = 1.0  # HMOC parameters
+itrack = 3
+wd = 0.5
+dceps = 1.0e-5
+nplane = 1
+npl = 0
+nph = 16
+npmin = 2
+npmax = 32
+dchmoc = 1.0e-3
+nlsink = nplane
+npsink = nph
+
+# ====== Set static temporal data used by tdis file
+tdis_rc = []
+tdis_rc.append((perlen, nstp, 1.0))
+
+# =============================================================================
+# ===== 2.0 CREATE FLOW MODEL OBJECTS AND DEFINE FLOW PACKAGES ================
+# =============================================================================
+name = "Base"
+gwfname = "gwf-" + name
+sim_ws = ws
+sim = flopy.mf6.MFSimulation(sim_name=sim_name,
+                             sim_ws=sim_ws,
+                             exe_name=mf6exe)
+
+# ===== 2.1 Defining MODFLOW 6 time discretization
+tdis_rc = []
+for i in range(nper):
+    tdis_rc.append((perlen[i], nstp[i], tsmult[i]))
+
+flopy.mf6.ModflowTdis(sim,
+                      nper=nper,
+                      perioddata=tdis_rc,
+                      time_units=time_units)
+        
+# ===== 2.2 Defining MODFLOW 6 groundwater flow model
+gwf = flopy.mf6.ModflowGwf(sim,
+                           modelname=gwfname,
+                           save_flows=True,
+                           model_nam_file="{}.nam".format(gwfname),)       
+        
+# ===== 2.3 Defining MODFLOW 6 solver for flow model
+imsgwf = flopy.mf6.ModflowIms(sim,
+                              print_option="SUMMARY",
+                              outer_dvclose=hclose,
+                              outer_maximum=nouter,
+                              under_relaxation="NONE",
+                              inner_maximum=ninner,
+                              inner_dvclose=hclose,
+                              rcloserecord=rclose,
+                              linear_acceleration="CG",
+                              scaling_method="NONE",
+                              reordering_method="NONE",
+                              relaxation_factor=relax,
+                              filename="{}.ims".format(gwfname),)
+
+sim.register_ims_package(imsgwf, [gwf.name])
+
+# ===== 2.4 Defining MODFLOW 6 discretization package
+flopy.mf6.ModflowGwfdis(gwf,
+                        length_units=length_units,
+                        nlay=nlay,
+                        nrow=nrow,
+                        ncol=ncol,
+                        delr=delr,
+                        delc=delc,
+                        top=top,
+                        botm=botm,
+                        idomain=idomain,
+                        filename="{}.dis".format(gwfname),)
+
+# ===== 2.5 Defining MODFLOW 6 node-property flow package
+flopy.mf6.ModflowGwfnpf(gwf,
+                        save_flows=False,
+                        icelltype=icelltype,
+                        k=k11,
+                        k33=k33,
+                        save_specific_discharge=True,
+                        filename="{}.npf".format(gwfname),)
+
+# ===== 2.6 Defining MODFLOW 6 initial conditions package for flow model
+flopy.mf6.ModflowGwfic(gwf,
+                       strt=strt,
+                       filename="{}.ic".format(gwfname),)
+
+# # ===== 2.7 Define MODFLOW 6 storage package
+# sto = flopy.mf6.ModflowGwfsto(gwf,
+#                               ss=0,
+#                               sy=0,
+#                               filename="{}.sto".format(gwfname),)
+
+# ===== 2.8 Defining MODFLOW 6 constant head package
+flopy.mf6.ModflowGwfchd(gwf,
+                        maxbound=len(chdspd),
+                        stress_period_data=chdspd,
+                        save_flows=False,
+                        auxiliary="CONCENTRATION",
+                        pname="CHD-1",
+                        filename="{}.chd".format(gwfname),)
+
+# ===== 2.9 Defining MODFLOW well package
+flopy.mf6.ModflowGwfwel(gwf,
+                        print_input=True,
+                        print_flows=True,
+                        stress_period_data=spd_mf6,
+                        save_flows=False,
+                        auxiliary="CONCENTRATION",
+                        pname="WEL-1",
+                        filename="{}.wel".format(gwfname),)
+
+# ===== 2.10 Defining MODFLOW recharge package
+# Method 1 - Using general recharge package
+flopy.mf6.ModflowGwfrch(gwf,
+                        print_input=True,
+                        print_flows=True,
+                        stress_period_data=rchspd,
+                        save_flows=False,
+                        auxiliary="CONCENTRATION",
+                        pname="RCH-1",
+                        filename="{}.rch".format(gwfname),)
+
+# Method 2 - Using array-based recharge package
+# flopy.mf6.ModflowGwfrcha(gwf,
+#                         print_input=True,
+#                         print_flows=True,
+#                         recharge = rech,
+#                         save_flows=False,
+#                         auxiliary="CONCENTRATION",
+#                         pname="RCH-1",
+#                         filename="{}.rch".format(gwfname),)
+
+# ===== 2.11 Defining MODFLOW 6 output control package for flow model
+flopy.mf6.ModflowGwfoc(gwf,
+                       head_filerecord="{}.hds".format(gwfname),
+                       budget_filerecord="{}.bud".format(gwfname),
+                       headprintrecord=[("COLUMNS", 10, "WIDTH", 15,
+                                         "DIGITS", 6, "GENERAL")],
+                       saverecord=[("HEAD", "ALL"), ("BUDGET", "ALL")],
+                       printrecord=[("HEAD", "ALL"), ("BUDGET", "ALL")],)
+
+# =============================================================================
+# ===== 3.0 CREATE TRANSPORT MODEL OBJECTS AND DEFINE TRANSPORT PACKAGES ======
+# =============================================================================
+gwtname = "gwt_" + name
+gwt = flopy.mf6.MFModel(sim,
+                        model_type="gwt6",
+                        modelname=gwtname,
+                        model_nam_file="{}.nam".format(gwtname),)
+gwt.name_file.save_flows = True
+
+# ===== 3.1 Create iterative model solution and register the gwt model with it
+imsgwt = flopy.mf6.ModflowIms(sim,
+                              print_option="SUMMARY",
+                              outer_dvclose=hclose,
+                              outer_maximum=nouter,
+                              under_relaxation="NONE",
+                              inner_maximum=ninner,
+                              inner_dvclose=hclose,
+                              rcloserecord=rclose,
+                              linear_acceleration="BICGSTAB",
+                              scaling_method="NONE",
+                              reordering_method="NONE",
+                              relaxation_factor=relax,
+                              filename="{}.ims".format(gwtname),)
+sim.register_ims_package(imsgwt, [gwt.name])
+
+# ===== 3.2 Defining MODFLOW 6 transport discretization package
+flopy.mf6.ModflowGwtdis(gwt,
+                        nlay=nlay,
+                        nrow=nrow,
+                        ncol=ncol,
+                        delr=delr,
+                        delc=delc,
+                        top=top,
+                        botm=botm,
+                        idomain=1,
+                        filename="{}.dis".format(gwtname),)
+
+# ===== 3.3 Defining MODFLOW 6 transport initial concentrations
+flopy.mf6.ModflowGwtic(gwt,
+                       strt=sconc,
+                       filename="{}.ic".format(gwtname),)
+
+# ===== 3.4 Defining MODFLOW 6 transport advection package
+if mixelm == 0:
+    scheme = "UPSTREAM"
+elif mixelm == -1:
+    scheme = "TVD"
+else:
+    raise Exception()
+
+flopy.mf6.ModflowGwtadv(gwt,
+                        scheme=scheme,
+                        filename="{}.adv".format(gwtname),)
+
+
+# ===== 3.5 Defining MODFLOW 6 transport dispersion package
+if al != 0:
+    flopy.mf6.ModflowGwtdsp(gwt,
+                            xt3d_off=True,
+                            alh=al,
+                            ath1=ath1,
+                            ath2=ath2,
+                            diffc=dmcoef,
+                            filename="{}.dsp".format(gwtname),)
+
+# ===== 3.6 Defining MODFLOW 6 transport mass storage package
+#      (formerly "reaction" package in MT3DMS)
+flopy.mf6.ModflowGwtmst(gwt,
+                        porosity=prsity,
+                        first_order_decay=False,
+                        decay=None,
+                        decay_sorbed=None,
+                        sorption=None,
+                        bulk_density=None,
+                        distcoef=None,
+                        filename="{}.mst".format(gwtname),)
+
+# ===== 3.7 Defining MODFLOW 6 transport constant concentration package
+# flopy.mf6.ModflowGwtcnc(gwt,
+#                         maxbound=len(cncspd),
+#                         stress_period_data=cncspd,
+#                         save_flows=False,
+#                         pname="CNC-1",
+#                         filename="{}.cnc".format(gwtname),)
+
+# ===== 3.8 Defining MODFLOW 6 transport source-sink mixing package
+sourcearray = [("WEL-1", "AUX", "CONCENTRATION"),
+                  ("CHD-1", "AUX", "CONCENTRATION"),
+                  ("RCH-1", "AUX", "CONCENTRATION")]
+flopy.mf6.ModflowGwtssm(gwt,
+                        sources=sourcearray,
+                        filename="{}.ssm".format(gwtname),)
+
+# ===== 3.9 Defining MODFLOW 6 transport output control package
+flopy.mf6.ModflowGwtoc(gwt,
+                       budget_filerecord="{}.cbc".format(gwtname),
+                       concentration_filerecord="{}.ucn".format(gwtname),
+                       concentrationprintrecord=[
+                           ("COLUMNS", 10, "WIDTH", 15, "DIGITS", 6,
+                            "GENERAL")],
+                       saverecord=[("CONCENTRATION", "ALL"),
+                                   ("BUDGET", "LAST")],
+                       printrecord=[("CONCENTRATION", "LAST"),
+                                    ("BUDGET", "LAST")],)
+
+# Defining MODFLOW 6 flow-transport exchange mechanism
+flopy.mf6.ModflowGwfgwt(sim,
+                        exgtype="GWF6-GWT6",
+                        exgmnamea=gwfname,
+                        exgmnameb=gwtname,
+                        filename="{}.gwfgwt".format(name),)
+
+# =============================================================================
+# ===== 4.0 CREATE MODFLOW 6 INPUT FILES AND RUN THE SIMULATION ===============
+# =============================================================================
+
+# ===== 4.1 Write input files
+sim.write_simulation()
+
+# ===== 4.2 Run the simulation
+success, buff = sim.run_simulation()
+assert success, "MODFLOW 6 did not terminate normally."
+
+# =============================================================================
+# ===== 5.0 POST-PROCESS SIMULATION RESULTS ===================================
+# =============================================================================
+# ===== 5.1 Extracting simulation data ========================================
+
+# Get the MF6 flow model output
+# ===== Output method
+ucnobj_mf6_head = gwf.output.head()
+head = ucnobj_mf6_head.get_alldata()
+# timesteps_h = ucnobj_mf6_head.times
+# head_end = head[-1]
+# ===== Binary file method
+# fname = 'Run000/gwf-Base.hds'
+# hdobj = flopy.utils.HeadFile(fname)
+# head = hdobj.get_data()
+
+# ===== Get the MF6 transport model output (concentration)
+ucnobj_mf6_conc = gwt.output.concentration()
+conc = ucnobj_mf6_conc.get_alldata()
+timesteps = ucnobj_mf6_conc.times
+
+# ===== Set timestep to use
+targetTime = 4600 # Days from start of simulation #4600 maybe 5015 or 23265
+timeIDX = [i for i, v in enumerate(timesteps) if v >= targetTime][0]
+dispTime = timesteps[timeIDX]
+    
+# ===== Set layer to plot
+klay = 0 # 0 = top layer
+
+#======================================================================================------------------------------------------------------------------------------------
+# ===== Calculate average head and concentration in specified grid area ======
+# Define indices based on grid spacing and specified ranges
+x_start, x_end = int(1000 / delc), int(2000 / delc)
+y_start, y_end = int(0 / delr), int(1200 / delr)
+
+# Average concentration
+avg_conc = np.mean(conc[timeIDX, klay, y_start:y_end+1, x_start:x_end+1])
+print(f"Average concentration between x: 1400-1500m and y: 800-900m is: {avg_conc}")
+
+# Average head
+avg_head = np.mean(head[timeIDX, klay, y_start:y_end+1, x_start:x_end+1])
+print(f"Average hydraulic head between x: 1400-1500m and y: 800-900m is: {avg_head}")
+
+# ===== 5.2 Plotting map of head data =========================================
+fig = plt.figure(figsize=(8,8),dpi=300, tight_layout=True)
+ax = fig.add_subplot(1, 1, 1, aspect="equal")
+ax.set_title("Hydrualic Head: Layer " + "{}".format(klay) +
+             " (Time = " + "{}".format(dispTime) + " "
+             "{}".format(time_units) + ")",
+             loc='left')
+plt.xlabel("Distance along x-axis [m]")
+plt.ylabel("Distance along y-axis [m]")
+mapview = flopy.plot.PlotMapView(model=gwf)
+theLevels = np.linspace(2,4,num=21)
+contour_set = mapview.contour_array(head[timeIDX,klay,:,:],
+                                    levels=theLevels,
+                                    colors='k',
+                                    linestyles='--')
+plt.clabel(contour_set, inline=1, fontsize=10)
+# plt.colorbar(contour_set, shrink=0.250)
+quadmesh = mapview.plot_array(head[timeIDX,klay,:,:], alpha=1)
+cb = plt.colorbar(quadmesh, shrink=0.25)
+quadmesh = mapview.plot_bc("CHD",color='pink')
+quadmesh = mapview.plot_bc("WEL-1",color='grey')
+linecollection = mapview.plot_grid()
+
+# ===== 5.3 Plotting map of solute data =======================================
+minC = 0.0 # Minium concentration to display
+maxC = 100.0 # Maximum concentration to diplay
+fig = plt.figure(figsize=(8, 8),dpi=300, tight_layout=True)
+ax = fig.add_subplot(1, 1, 1, aspect="equal")
+ax.set_title("Solute plume: Layer " + "{}".format(klay) +
+             " (Time = " + "{}".format(dispTime) + " "
+             "{}".format(time_units) + ")",
+             loc='left')
+plt.xlabel("Distance along x-axis [m]")
+plt.ylabel("Distance along y-axis [m]")
+mapview = flopy.plot.PlotMapView(model=gwf,
+                                 layer=klay)
+quadmesh = mapview.plot_array(conc[timeIDX,klay,:,:],
+                              vmin=minC,vmax=maxC,
+                              cmap='jet')
+cb = plt.colorbar(quadmesh, shrink=0.5)
+contour_set = mapview.contour_array(conc[timeIDX,klay,:,:],
+                                    levels=[0.1, 1.0, 10.0, 50.0],
+                                    colors="w",
+                                    linestyles="--")
+plt.clabel(contour_set, inline=1, fontsize=10)
+quadmesh = mapview.plot_bc("CHD",color='pink')
+quadmesh = mapview.plot_bc("WEL-1",color='grey')
+# plt.colorbar(contour_set, shrink=0.50)
+linecollection = mapview.plot_grid()
+
+
+# ===== 5.4 Plotting cross-section of head and solute data
+colID = jcolx_leak # Specify the row to use for cross section
+
+fig = plt.figure(figsize=(12, 12),dpi=300, tight_layout=True)
+# Hydraluic heads vertical section
+ax = fig.add_subplot(2, 1, 1,aspect=90)
+ax.set_title("(a) Hydraulic head: Vertical section - Column " +
+             "{}".format(colID) + " (Time = " + "{}".format(dispTime) + " "
+             "{}".format(time_units) + ")", loc='left')
+plt.xlabel("Distance along y-axis [m]")
+plt.ylabel("Elevation (z-axis) [m]")
+xsect = flopy.plot.PlotCrossSection(model=gwf, line={"column": colID})
+csa = xsect.plot_array(head, head=head,alpha=0.5)
+cb = plt.colorbar(csa, shrink=0.25)
+contour_set = xsect.contour_array(head,
+                                  head=head,
+                                  levels=theLevels,
+                                  colors="k",
+                                  linestyles='--')
+plt.clabel(contour_set, fmt="%.1f", colors="k", fontsize=11)
+patches = xsect.plot_bc("CHD",color='pink')
+patches = xsect.plot_bc("WEL-1",color='grey')
+linecollection = xsect.plot_grid()
+
+# Solute concetration vertical section
+ax = fig.add_subplot(2, 1, 2,aspect=90)
+ax.set_title("(b) Solute concentration: Vertical section - Column " +
+             "{}".format(colID) + " (Time = " + "{}".format(dispTime) + " "
+             "{}".format(time_units) + ")", loc='left')
+plt.xlabel("Distance along y-axis [m]")
+plt.ylabel("Elevation (z-axis) [m]")
+xsect = flopy.plot.PlotCrossSection(model=gwf, line={"column": colID})
+csa = xsect.plot_array(conc[timeIDX],
+                              vmin=minC,vmax=maxC,
+                              cmap='jet')
+cb = plt.colorbar(csa, shrink=0.25)
+patches = xsect.plot_bc("CHD",color='pink')
+patches = xsect.plot_bc("WEL-1",color='grey')
+linecollection = xsect.plot_grid()
+
+# ===== 5.5 Plotting solute breakthrough curve
+# ===== Setting plot formatting (global settings - applies to all plots)
+mS = 10 # Used to set marker size
+lW = 3 # Used to set linewidth
+fS = 16 # Used to set font size
+plt.rcParams['font.family'] = 'Times New Roman' # Globally sets the font type
+plt.rc('font',size=fS)
+plt.rc('axes',titlesize=fS)
+plt.rc('axes',labelsize=fS)
+plt.rc('xtick',labelsize=fS)
+plt.rc('ytick',labelsize=fS)
+plt.rc('legend',fontsize=fS)
+plt.rc('figure',titlesize=fS)
+
+
+fig = plt.figure(figsize=(8, 8),dpi=300, tight_layout=True)
+ax = fig.add_subplot(1, 1, 1)
+ax.set_title("Solute concentration: Various sites",loc='left')
+plt.xlabel("Time [d]")
+plt.ylabel("Concentration [kg m$^-$$^3$]")
+# Logarityhmic y-axis plots
+plt.semilogy(timesteps,conc[:,0,irowy_leak,jcolx_leak],
+             color='red',label='Leak site',linewidth=lW)
+
+plt.semilogy(timesteps,conc[:,0,1,jcolx_leak],
+             color='black',linestyle='solid',
+             label='Northern boundary',linewidth=lW)
+
+plt.semilogy(timesteps,conc[:,0,-2,jcolx_leak],
+             color='black',linestyle='dashed',
+             label='Southern boundary',linewidth=lW)
+
+plt.semilogy(timesteps,conc[:,2,irowy_ex1,jcolx_ex1],
+             color='yellow',linestyle='solid',
+             label='Extraction Well 1',linewidth=lW)
+
+plt.semilogy(timesteps,conc[:,2,irowy_ex2,jcolx_ex2],
+             color='yellow',linestyle='dashed',
+             label='Extraction Well 2',linewidth=lW)
+
+plt.semilogy(timesteps,conc[:,2,irowy_ex3,jcolx_ex3],
+             color='blue',linestyle='solid',
+             label='Extraction Well 3',linewidth=lW)
+
+plt.semilogy(timesteps,conc[:,2,irowy_ex4,jcolx_ex4],
+             color='blue',linestyle='dashed',
+             label='Extraction Well 4',linewidth=lW)
+# Natural y-axis plots
+# plt.plot(timesteps,conc[:,0,irowy_leak,jcolx_leak],label='Leak site')
+# plt.plot(timesteps,conc[:,0,irowy_leak,0],label='Lake')
+# plt.plot(timesteps,conc[:,0,irowy_leak,-1],label='River')
+# plt.plot(timesteps,conc[:,1,irowy_ex1,jcolx_ex1],label='Extraction Well 1')
+# plt.plot(timesteps,conc[:,1,irowy_ex2,jcolx_ex2],label='Extraction Well 2')
+plt.ylim([10e-3,100])
+plt.grid()
+plt.legend()
+
+
+
+
+
+
+
+
+
+# 3.0 ===== CALCULATING SKILL SCORES ==========================================
+# Extracting hydraulic head information
+W1_h = head[-1,2,irowy_ex1,jcolx_ex1] # Extracting h value for well 1
+W2_h = head[-1,2,irowy_ex2,jcolx_ex2] # Extracting h value for well 2
+W3_h = head[-1,2,irowy_ex3,jcolx_ex3] # Extracting h value for well 3
+W4_h = head[-1,2,irowy_ex4,jcolx_ex4] # Extracting h value for well 4
+MB_01 = head[-1, 2, irowy_ex5, jcolx_ex5]  # Extracting h value for MB-01
+MB_02 = head[-1, 2, irowy_ex6, jcolx_ex6]  # Extracting h value for MB-02
+MB_03 = head[-1, 2, irowy_ex7, jcolx_ex7]  # Extracting h value for MB-03
+MB_04 = head[-1, 2, irowy_ex8, jcolx_ex8]  # Extracting h value for MB-04
+MB_05 = head[-1, 2, irowy_ex9, jcolx_ex9]  # Extracting h value for MB-05
+MB_06 = head[-1, 2, irowy_ex10, jcolx_ex10]  # Extracting h value for MB-06
+MB_07 = head[-1, 2, irowy_ex11, jcolx_ex11]  # Extracting h value for MB-07
+MB_08 = head[-1, 2, irowy_ex12, jcolx_ex12]  # Extracting h value for MB-08
+MB_09 = head[-1, 2, irowy_ex13, jcolx_ex13]  # Extracting h value for MB-09
+MB_10 = head[-1, 2, irowy_ex14, jcolx_ex14]  # Extracting h value for MB-10
+P_h = np.array([W1_h, W2_h, W3_h, W4_h, MB_01, MB_02, MB_03, MB_04, MB_05, MB_06, MB_07, MB_08, MB_09, MB_10])
+O_h = np.array([2.749, 2.963, 2.542, 2.480, 3.320, 3.484, 3.477, 3.435, 3.298, 3.275, 3.062, 3.067, 2.826, 2.826])  # Combining h values into a single array
+
+
+# 3.1 Pearson's correlation coefficient
+# Defining function using equation from table 5 of Moriasi et al 2015)
+def f_R2(O_h,P_h): # where O = observed data and P = predicted data
+    Omean = np.mean(O_h)
+    Pmean = np.mean(P_h)
+    r = (np.sum((O_h-Omean)*(P_h-Pmean)))/(np.sqrt(np.sum((O_h-Omean)**2))*
+          np.sqrt(np.sum((P_h-Pmean)**2)))
+    R = r**2
+    return R
+
+# Use function to calcuate correlation coefficient
+
+R2_BC = f_R2(O_h,P_h)
+
+
+# 3.2 NSE
+# Defining function using equation from table 5 of Moriasi et al 2015)
+def f_NSE(O,P):
+    Omean = np.mean(O)
+    NSE = 1 - ((np.sum((O-P)**2))/(np.sum((O-Omean)**2)))
+    return NSE
+
+# Use function to calcuate NSE value
+
+NSE_BC = f_NSE(O_h,P_h)
+
+# 3.3 RMSE
+# Defining function using equation from table 5 of Moriasi et al 2015)
+def f_RMSE(O,P):
+    dims = np.shape(O)
+    n = dims[0]
+    RMSE = np.sqrt((1/n)*np.sum((O-P)**2))
+    return RMSE
+
+# Use function to calcuate RMSE values
+
+RMSE_BC = f_RMSE(O_h,P_h)
+
+
+
+# 3.4 PBIAS
+# Defining function using equation from table 5 of Moriasi et al 2015)
+def f_PBIAS(O,P):
+    PBIAS = ((np.sum(O-P))/(np.sum(O)))*100
+    return PBIAS
+
+# Use function to calcuate RMSE
+
+PBIAS_BC = f_PBIAS(O_h,P_h)
+
+
+# 4.0 ===== EXPORTING SKILL SCORES TO SINGLE CSV FILE =========================
+outFileName = 'SkillScores.csv'
+header1 = ['Skill Score', 'Model 1']
+ListOfSkillScores = 'R_squared','NSE','RMSE','PBIAS'
+Model_1_Scores = R2_BC,NSE_BC,RMSE_BC,PBIAS_BC
+
+
+# 0.0 ===== IMPORTING PACKAGES / MODULES ======================================
+import numpy as np                            # Basic mathematics library
+import matplotlib.pyplot as plt               # Imports plotting library
+import csv    #Imports csv module
+
+# 1.0 ===== LOADING INPUT DATA ================================================
+infile_name = 'C:/CIVL4145/Week 5/CIVL4145-EvaluationExample-InitialData.csv'
+
+# Establishing variables
+Step = []                   # Establishes new variable
+x = []                      # Establishes new variable (air temperature data)
+y = []                      # Establishes new variable (monitoring data)
+# Model simluation outputs not imported - instead models are set-up in this
+# script - see below.
+# y1 = []                     # Establishes new variable (model 1)
+# y2 = []                     # Establishes new variable (model 2)
+# y3 = []                     # Establishes new variable (model 3)
+
+# Using for loop to read in data values from csv file sequentially
+with open(infile_name) as csvDataFile:
+    csvReader = csv.reader(csvDataFile)
+    for z in range(3):  #Skip first 3 rows of input file (header information)
+        next(csvReader)
+    for row in csvReader:
+        Step.append(row[0])   # Appends 1st value in row to Date_in variable
+        x.append(row[1])
+        y.append(row[2])
+        # y1.append(row[3])
+        # y2.append(row[4])
+        # y3.append(row[5])
+       
+del infile_name, row          # Deleting variables to de-clutter
+del csvDataFile, csvReader, z # Deleting variables to de-clutter
+
+# Converting list data into floating point variables
+Step = [float(x) for x in Step]
+x = [float(i) for i in x]
+y = [float(x) for x in y]
+# y1 = [float(x) for x in y1]
+# y2 = [float(x) for x in y2]
+# y3 = [float(x) for x in y3]
+
+# Converting lists to numpy arrays
+Step = np.array(Step)
+x = np.array(x)
+y = np.array(y)
+# y1 = np.array(y1)
+# y2 = np.array(y2)
+# y3 = np.array(y3)
+
+
+
+#=====================EXPERIMENTAL====================
+
+# Data for hydraulic conductivity, porosity, and other variables with positive and negative impacts
+data = [
+    ["Hydraulic Conductivity", 0.48, -0.79],  # Positive and Negative impacts for Hydraulic Conductivity
+    ["Porosity", 0.10, -0.05],                # Positive and Negative impacts for Porosity
+    ["Variable 3", 0.25, -0.15],              # Example for another variable
+    ["Variable 4", 0.35, -0.20],              # Another example
+]
+
+# Create a DataFrame
+df = pd.DataFrame(data, columns=["Variable", "PosDeviation", "NegDeviation"])
+
+# Calculate the absolute values for sorting
+df['AbsDeviation'] = df[['PosDeviation', 'NegDeviation']].abs().max(axis=1)
+
+# Sort the DataFrame based on the absolute deviation
+df_sorted = df.sort_values(by='AbsDeviation', ascending=False)
+
+# Create the tornado diagram
+sns.set_theme(style="whitegrid")
+plt.figure(figsize=(10, 6))
+
+# Plot positive and negative deviations for all variables
+sns.barplot(x="PosDeviation", y="Variable", data=df_sorted, color="blue", label='Positive Impact', orient="h")
+sns.barplot(x="NegDeviation", y="Variable", data=df_sorted, color="red", label='Negative Impact', orient="h")
+
+# Add a vertical baseline
+plt.axvline(0, color="black", linestyle="--")
+
+# Disable horizontal gridlines
+plt.grid(axis='y', linestyle='--', alpha=0.7)  # Keep vertical gridlines for clarity
+
+# Customize the diagram
+plt.title("Tornado Diagram: Various Variables (Sorted by Impact)")
+plt.xlabel("Deviation of head from Base Case")
+plt.ylabel("Variable")
+plt.legend()
+
+# Show the plot
+plt.show()
+
+
+
+
+
+
+# Define the concentration threshold
+threshold = 1e-2
+
+# Function to find and print intersections
+def find_intersections(timesteps, concentration, label):
+    for i in range(1, len(timesteps)):
+        if (concentration[i-1] > threshold and concentration[i] < threshold) or \
+           (concentration[i-1] < threshold and concentration[i] > threshold):
+            # Linear interpolation to estimate the intersection time
+            t1, t2 = timesteps[i-1], timesteps[i]
+            c1, c2 = concentration[i-1], concentration[i]
+            intersection_time = t1 + (threshold - c1) * (t2 - t1) / (c2 - c1)
+            print(f"{label} intersects at time: {intersection_time:.2f} days with concentration {threshold}")
+
+# Leak site (red curve)
+find_intersections(timesteps, conc[:,0,irowy_leak,jcolx_leak], "Leak site")
+
+# Northern boundary (black solid curve)
+find_intersections(timesteps, conc[:,0,1,jcolx_leak], "Northern boundary")
+
+# Southern boundary (black dashed curve)
+find_intersections(timesteps, conc[:,0,-2,jcolx_leak], "Southern boundary")
+
+# Extraction Well 1 (yellow solid curve)
+find_intersections(timesteps, conc[:,2,irowy_ex1,jcolx_ex1], "Extraction Well 1")
+
+# Extraction Well 2 (yellow dashed curve)
+find_intersections(timesteps, conc[:,2,irowy_ex2,jcolx_ex2], "Extraction Well 2")
+
+# Extraction Well 3 (blue solid curve)
+find_intersections(timesteps, conc[:,2,irowy_ex3,jcolx_ex3], "Extraction Well 3")
+
+# Extraction Well 4 (blue dashed curve)
+find_intersections(timesteps, conc[:,2,irowy_ex4,jcolx_ex4], "Extraction Well 4")
+#=====================EXPERIMENTAL====================
+
+print('')
+
+# Define the concentration threshold
+threshold_value = 0.0194
+
+# Function to find and print times when concentration reaches the specified threshold
+def find_time_at_threshold(timesteps, concentration, label):
+    for i in range(1, len(timesteps)):
+        if (concentration[i-1] < threshold_value and concentration[i] >= threshold_value) or \
+           (concentration[i-1] >= threshold_value and concentration[i] < threshold_value):
+            # Linear interpolation to estimate the time at which concentration reaches the threshold
+            t1, t2 = timesteps[i-1], timesteps[i]
+            c1, c2 = concentration[i-1], concentration[i]
+            intersection_time = t1 + (threshold_value - c1) * (t2 - t1) / (c2 - c1)
+            print(f"{label} reaches {threshold_value} at time: {intersection_time:.2f} days")
+
+# Example usage for different sites
+find_time_at_threshold(timesteps, conc[:,0,irowy_leak,jcolx_leak], "Leak site")
+find_time_at_threshold(timesteps, conc[:,0,1,jcolx_leak], "Northern boundary")
+find_time_at_threshold(timesteps, conc[:,0,-2,jcolx_leak], "Southern boundary")
+find_time_at_threshold(timesteps, conc[:,2,irowy_ex1,jcolx_ex1], "Extraction Well 1")
+find_time_at_threshold(timesteps, conc[:,2,irowy_ex2,jcolx_ex2], "Extraction Well 2")
+find_time_at_threshold(timesteps, conc[:,2,irowy_ex3,jcolx_ex3], "Extraction Well 3")
+find_time_at_threshold(timesteps, conc[:,2,irowy_ex4,jcolx_ex4], "Extraction Well 4")
+
+print('')
+
+
+# Using "zip" funciton to combine variables
+outData = zip(ListOfSkillScores, Model_1_Scores)
+with open(outFileName,'w') as f:
+    writer = csv.writer(f,lineterminator='\n')
+    writer.writerow(header1)
+    for row in outData:
+        writer.writerow(row)
+
+print('')
+print('Summary of skill scores:')
+print('')
+print(header1[0],'|',header1[1])
+
+print(ListOfSkillScores[0],'  | {:.3f}'.format(R2_BC))  
+    
+print(ListOfSkillScores[1],'        | {:.3f}'.format(NSE_BC))   
+     
+print(ListOfSkillScores[2],'       | {:.3f}'.format(RMSE_BC))
+    
+print(ListOfSkillScores[3],'      | {:.3f}'.format(PBIAS_BC))
+    
+print('')
+
+print('The hydraulic head is', W1_h, 'metres at the pumping well 1')
+print('The hydraulic head is', W2_h, 'metres at the pumping well 2')
+print('The hydraulic head is', W3_h, 'metres at the pumping well 3')
+print('The hydraulic head is', W4_h, 'metres at the pumping well 4')
+
+del outFileName, header1, ListOfSkillScores
+del Model_1_Scores
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Correlation plot
+fig, ax1 = plt.subplots(1, 1, figsize=(6, 5), dpi=300)
+ax1.plot(O_h, P_h, 's', c='k', label='Base Case', markersize=mS, linewidth=lW)
+
+# Best fit line
+slope, intercept = np.polyfit(O_h, P_h, 1)  # Fit a line (degree 1 polynomial)
+best_fit_line = slope * O_h + intercept
+ax1.plot(O_h, best_fit_line, '-', c='r', label='Best Fit Line', linewidth=lW)
+
+# Ideal line
+ax1.plot([2.5, 3.0], [2.5, 3.0], '--', c='k', markersize=mS, linewidth=lW, label='Ideal Line')
+
+# Grid and labels
+ax1.grid()
+ax1.set_xlabel('Observed hydraulic head [m AHD]')
+ax1.set_ylabel('Predicted hydraulic head [m AHD]')
+ax1.set_title('Correlation plot', loc='left')
+ax1.legend()  # Add legend to show best fit line and ideal line
+
+plt.show()
+
+
+print('')
+
+from datetime import datetime, timedelta
+
+# End date of the simulation
+end_date = datetime(2024, 9, 25)
+
+# Total time in days
+total_time = 22655  # Days from injection to concentration drop
+
+# Calculate start date
+start_date = end_date - timedelta(days=total_time)
+
+print("Start Date of the Plume:", start_date.strftime("%d/%m/%Y"))
+# Display first few rows of each dataset
+print(installation_data.head())
+print(water_level_data.head())
+print(nitrate_data.head())
+
+# Step 2: Set 'Location' as the index column
+nitrate_data.set_index('Location', inplace=True)
+
+# Step 3: Display the processed data and check for any issues
+print("Nitrate Concentration Data:")
+print(nitrate_data.head())
+print("\nColumn Names:")
+print(nitrate_data.columns)
+print("\nData Types:")
+print(nitrate_data.dtypes)
+print("\nCount of NaNs in each column:")
+print(nitrate_data.isna().sum())
+
+# Strip any extra spaces from column names
+nitrate_data.columns = nitrate_data.columns.str.strip()
+
+# Convert to numeric, forcing errors to NaN
+nitrate_data = nitrate_data.apply(pd.to_numeric, errors='coerce')
+
+# Step 4: Access specific well data (e.g., Well3)
+well3_data = nitrate_data.loc['Well3']
+print("\nNitrate Concentration at Well3:")
+print(well3_data)
+
+# Step 5: Access nitrate concentration on a specific date (e.g., 25-Sep-2024)
+nitrate_on_25sep = nitrate_data['25-Sep-24']
+print("\nNitrate Concentration on 25-Sep-24:")
+print(nitrate_on_25sep)
+
+# Step 6: Optional - Plot nitrate concentration trends for Well3
+# Assuming well3_data is already defined
+well3_data_numeric = pd.to_numeric(well3_data, errors='coerce')
+
+# Create a new figure for the Well3 plot
+plt.figure(figsize=(8, 5), dpi=300)  # Adjust the size and resolution as needed
+
+# Transpose the data for plotting
+well3_data_numeric.plot()
+
+# Set the plot title and labels
+plt.title('Nitrate Concentration at Well3')
+plt.xlabel('Date')
+plt.ylabel('Nitrate Concentration (kg/m^3)')
+plt.xticks(rotation=45)  # Rotate x-axis labels for better visibility
+plt.grid(True)
+
+print('')
+# Function to print MB head values and compare calculated with observed values
+def print_mb_heads():
+    print("Comparison of Calculated and Observed Head Values:")
+    for i in range(1, 11):  # Loop from 1 to 10 for MB-01 to MB-10
+        calculated_head = eval(f'MB_{i:02}')  # Dynamically get MB values
+        observed_head = head_values_mb[f'MB-{i:02}']  # Get corresponding observed value
+        print(f"MB-{i:02}: Calculated Head = {calculated_head:.2f}, Observed Head = {observed_head:.2f}")
+
+# Call the function to print the MB head values
+print_mb_heads()
+
+# =============================================================================
+# ======= END OF SCRIPT ======= END OF SCRIPT ======= END OF SCRIPT ===========
+# =============================================================================
